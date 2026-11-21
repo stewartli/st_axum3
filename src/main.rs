@@ -1,10 +1,14 @@
 // Topic: basic
 
 use axum::{
-    Json, Router,
-    body::Body,
-    extract::{Path, Query, Request, State},
-    http::{HeaderValue, Method, StatusCode},
+    Form, Json, Router,
+    body::{Body, Bytes, HttpBody},
+    extract::{
+        ConnectInfo, FromRequest, FromRequestParts, MatchedPath, NestedPath,
+        OptionalFromRequestParts, OriginalUri, Path, Query, RawPathParams, RawQuery, Request,
+        State, rejection::BytesRejection,
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, Version, header},
     response::{Html, IntoResponse, NoContent, Redirect, Response},
     routing::{MethodFilter, any, get},
 };
@@ -12,11 +16,11 @@ use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
-use std::{convert::Infallible, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc};
 
 #[tokio::main]
 async fn main() {
-    // 1. logger
+    // 1. logger [RUST_LOG]
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -48,19 +52,32 @@ async fn main() {
     // 3.3 any, on, head, options,
     let app = Router::new()
         .route("/health", get(handle_health))
-        .route("/echo1", get(handle_req).head(handle_req))
+        .route(
+            "/echo1",
+            get(handle_req)
+                .head(handle_req)
+                .post(handle_query)
+                .put(handle_key),
+        )
         .route(
             "/echo2",
             any(handle_any).on(MethodFilter::GET.or(MethodFilter::POST), handle_req),
         )
-        .route("/data/{id}/{*job}", get(handle_data).put(handle_data1))
+        .route(
+            "/data/{id}/{*job}",
+            get(handle_data)
+                .put(handle_data1)
+                .patch(handle_data2)
+                .post(handle_form),
+        )
         .route("/api/v1", get(handle_api).post(handle_204))
         .nest("/api", nest_api_route)
         .merge(merge_admin_route)
         .with_state(db)
         .fallback(handle_404)
         .fallback_service(ServeDir::new("./static"))
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     tracing::info!("server running at {}", listener.local_addr().unwrap());
     axum::serve(listener, app)
@@ -133,7 +150,15 @@ async fn handle_health(State(db): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn handle_data(Path((id, job)): Path<(i32, String)>) -> Result<String, AppErr> {
+async fn handle_data(Path(id): Path<i32>) -> Result<Json<i32>, StatusCode> {
+    let data = vec![1, 1, 2, 3, 4];
+    data.into_iter()
+        .find(|&x| x == id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_MODIFIED)
+}
+
+async fn handle_data1(Path((id, job)): Path<(i32, String)>) -> Result<String, AppErr> {
     // http://127.0.0.1:8080/data/3/mas
     if id > 10 {
         Ok(format!("{job} num = {id}"))
@@ -144,12 +169,8 @@ async fn handle_data(Path((id, job)): Path<(i32, String)>) -> Result<String, App
     }
 }
 
-async fn handle_data1(Path(id): Path<i32>) -> Result<Json<i32>, StatusCode> {
-    let data = vec![1, 1, 2, 3, 4];
-    data.into_iter()
-        .find(|&x| x == id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_MODIFIED)
+async fn handle_data2(Path(x): Path<HashMap<String, String>>) -> Json<HashMap<String, String>> {
+    Json(x)
 }
 
 async fn handle_404(Query(name): Query<String>) -> Html<String> {
@@ -160,7 +181,198 @@ async fn handle_404(Query(name): Query<String>) -> Html<String> {
     }
 }
 
-// 4. request
+#[allow(clippy::too_many_arguments)]
+async fn handle_query(
+    Query(x): Query<HelloApi>,
+    RawQuery(g): RawQuery,
+    OriginalUri(d): OriginalUri,
+    y: HeaderMap,
+    h: RawPathParams,
+    w: MatchedPath,
+    c: NestedPath,
+    u: ConnectInfo<SocketAddr>,
+    a: Method,
+    l: Uri,
+    v: Version,
+    z: Body,
+) -> Json<serde_json::Value> {
+    // more extractor: headers, bytes, route, ip, method, uri, version,
+    let mut res = String::new();
+    for (name, val) in y.iter() {
+        if let Ok(v) = val.to_str() {
+            res.push_str(&format!("{name}: {v}"));
+        }
+    }
+    for (name, val) in &h {
+        res.push_str(&format!("{name}: {val}"));
+    }
+
+    match g {
+        Some(txt) => println!("{txt}"),
+        None => println!("no idea"),
+    }
+
+    println!("route  => {}", w.as_str());
+    println!("connect to => {}", u.ip());
+    println!("original uri => {}", d.path());
+    println!(
+        "{a}, {v:?}, {}, {}, {}",
+        c.as_str(),
+        l.path(),
+        l.query().unwrap()
+    );
+    println!("raw bytes => {:?}", z.size_hint());
+
+    Json(serde_json::json!({
+        "version": x.version,
+        "desc": x.desc,
+    }))
+}
+
+async fn handle_form(x: Form<HelloApi>) -> Json<serde_json::Value> {
+    // async fn handle_form(x: RawForm) -> Json<serde_json::Value> {}
+    // Option<Json<HelloApi>>, Result<Json<HelloApi>, ()>,
+    Json(serde_json::json!({
+        "version": x.version,
+        "desc": x.desc,
+    }))
+}
+
+// 4. custom extractor
+struct MyKey(String);
+
+enum MyKeyReject {
+    Missing,
+    Malformed,
+}
+
+impl IntoResponse for MyKeyReject {
+    fn into_response(self) -> Response {
+        let (s, m) = match self {
+            Self::Missing => (StatusCode::UNAUTHORIZED, "missing key"),
+            Self::Malformed => (StatusCode::BAD_REQUEST, "wrong format"),
+        };
+        (s, Json(serde_json::json!({"error": m}))).into_response()
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for MyKey
+where
+    S: Send + Sync,
+{
+    type Rejection = MyKeyReject;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        if parts.headers.contains_key("x-api-key") {
+            <MyKey as FromRequestParts<S>>::from_request_parts(parts, state)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for MyKey
+where
+    S: Send + Sync,
+{
+    type Rejection = MyKeyReject;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let val = parts
+            .headers
+            .get("x-api-key")
+            .ok_or(MyKeyReject::Missing)?
+            .to_str()
+            .map_err(|_| MyKeyReject::Malformed)?;
+        if val.len() > 10 {
+            Ok(Self(val.to_string()))
+        } else {
+            Err(MyKeyReject::Missing)
+        }
+    }
+}
+
+struct MyLine(Vec<String>);
+
+#[allow(unused)]
+enum MyLineReject {
+    WrongType,
+    BadBody(BytesRejection),
+    NotUtf8,
+}
+
+impl IntoResponse for MyLineReject {
+    fn into_response(self) -> Response {
+        todo!()
+    }
+}
+
+impl<S> FromRequest<S> for MyLine
+where
+    S: Send + Sync,
+{
+    type Rejection = MyLineReject;
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let is_text = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|x| x.to_str().ok())
+            .is_some_and(|x| x.starts_with("text/plain"));
+        if !is_text {
+            return Err(MyLineReject::WrongType);
+        }
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(MyLineReject::BadBody)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| MyLineReject::NotUtf8)?;
+        Ok(MyLine(
+            text.lines()
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(String::from)
+                .collect(),
+        ))
+    }
+}
+
+struct MyClient {
+    addr: SocketAddr,
+    agent: String,
+}
+
+impl<S> FromRequestParts<S> for MyClient
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ConnectInfo(addr) = ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let agent = parts
+            .headers
+            .get(header::USER_AGENT)
+            .and_then(|x| x.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        Ok(Self { addr, agent })
+    }
+}
+
+async fn handle_key(client: MyClient, MyKey(x): MyKey, MyLine(y): MyLine) -> String {
+    format!("{}, {}, {x} {}", client.addr, client.agent, y.join(","))
+}
+
+// 5. request
 async fn handle_req(req: Request) -> Response {
     let (part, body) = req.into_parts();
     let _bytes = match axum::body::to_bytes(body, 64 * 1024).await {
@@ -178,7 +390,7 @@ async fn handle_req(req: Request) -> Response {
     res.into_response()
 }
 
-// 5. service
+// 6. service
 async fn handle_service(req: Request) -> Result<Response, Infallible> {
     let body = format!("url => {}", req.uri().path());
     let mut res = (StatusCode::OK, Body::from(body)).into_response();
